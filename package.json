@@ -1,0 +1,36 @@
+{
+  "name": "vimeodownloader",
+  "version": "1.0.0",
+  "description": "CLI tool to download Vimeo videos with directory structure preservation",
+  "main": "dist/index.js",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "vimeo-downloader": "./dist/index.js"
+  },
+  "scripts": {
+    "dev": "bun run index.ts",
+    "build": "bun build index.ts --outdir dist --target node",
+    "build:exe": "bun build index.ts --compile --outfile vimeo-downloader",
+    "build:exe-win": "bun build index.ts --compile --target=bun-windows-x64 --outfile vimeo-downloader.exe",
+    "build:exe-linux": "bun build index.ts --compile --target=bun-linux-x64 --outfile vimeo-downloader-linux",
+    "build:exe-mac": "bun build index.ts --compile --target=bun-darwin-x64 --outfile vimeo-downloader-mac",
+    "build:all": "npm run build:exe && npm run build:exe-win && npm run build:exe-linux && npm run build:exe-mac",
+    "clean": "rm -f vimeo-downloader vimeo-downloader.exe vimeo-downloader-* && rm -rf dist",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/fs-extra": "^11.0.4"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "axios": "^1.11.0",
+    "commander": "^14.0.0",
+    "dotenv": "^17.2.1",
+    "fs-extra": "^11.3.0"
+  }
+}
