@@ -1,5 +1,4 @@
-import axios, { AxiosInstance } from 'axios';
-import fs from 'fs-extra';
+import { existsSync, mkdirSync, unlinkSync, statSync } from 'fs';
 import path from 'path';
 import { Config, VimeoVideo, VimeoFolder, VimeoResponse, DownloadJob } from './types';
 import { ProgressTracker } from './ProgressTracker';
@@ -7,19 +6,17 @@ import { Semaphore } from './Semaphore';
 import { RetryUtil } from './RetryUtil';
 
 export class VimeoDownloader {
-  private api: AxiosInstance;
+  private baseUrl = 'https://api.vimeo.com';
+  private headers: Record<string, string>;
   private config: Config;
   private progressTracker: ProgressTracker;
 
   constructor(config: Config) {
     this.config = config;
-    this.api = axios.create({
-      baseURL: 'https://api.vimeo.com',
-      headers: {
-        'Authorization': `Bearer ${config.accessToken}`,
-        'Accept': 'application/vnd.vimeo.*+json;version=3.4',
-      },
-    });
+    this.headers = {
+      'Authorization': `Bearer ${config.accessToken}`,
+      'Accept': 'application/vnd.vimeo.*+json;version=3.4',
+    };
     this.progressTracker = new ProgressTracker();
   }
 
@@ -35,7 +32,7 @@ export class VimeoDownloader {
       console.log(`📁 Found ${folders.length} folders`);
       console.log(`🎥 Found ${videos.length} videos`);
       
-      await fs.ensureDir(this.config.downloadPath);
+      mkdirSync(this.config.downloadPath, { recursive: true });
       
       const downloadJobs = await this.prepareDownloadJobs(videos);
       
@@ -48,8 +45,45 @@ export class VimeoDownloader {
       await this.downloadVideos(downloadJobs);
       
       console.log('\n✅ Download process completed!');
+      this.printDownloadSummary();
     } catch (error) {
       console.error('❌ Error during download process:', error);
+      throw error;
+    }
+  }
+
+  private async apiRequest<T>(endpoint: string): Promise<T> {
+    const url = endpoint.startsWith('http') ? endpoint : `${this.baseUrl}${endpoint}`;
+    
+    try {
+      const response = await fetch(url, {
+        headers: this.headers,
+        signal: AbortSignal.timeout(30000), // 30 second timeout
+      });
+      
+      if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error('Authentication failed. Please check your access token.');
+        }
+        if (response.status === 403) {
+          throw new Error('Access forbidden. Please check your permissions.');
+        }
+        if (response.status === 429) {
+          throw new Error('Rate limited. Please wait before retrying.');
+        }
+        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+      }
+      
+      return await response.json();
+    } catch (error) {
+      if (error instanceof Error) {
+        if (error.name === 'TimeoutError') {
+          throw new Error(`Request timeout for ${url}`);
+        }
+        if (error.name === 'TypeError' && error.message.includes('fetch')) {
+          throw new Error(`Network error: Unable to reach ${url}`);
+        }
+      }
       throw error;
     }
   }
@@ -57,10 +91,10 @@ export class VimeoDownloader {
   private async verifyAuthentication(): Promise<void> {
     try {
       const response = await RetryUtil.withRetry(
-        () => this.api.get('/me'),
+        () => this.apiRequest<{ name: string }>('/me'),
         { maxRetries: 2, baseDelay: 1000, maxDelay: 5000 }
       );
-      console.log(`✅ Authenticated as: ${response.data.name}`);
+      console.log(`✅ Authenticated as: ${response.name}`);
     } catch (error) {
       throw new Error('Failed to authenticate with Vimeo API. Check your access token.');
     }
@@ -72,11 +106,9 @@ export class VimeoDownloader {
     
     while (nextUrl) {
       try {
-        const response = nextUrl.startsWith('http') 
-          ? await axios.get<VimeoResponse<VimeoFolder>>(nextUrl, { headers: this.api.defaults.headers })
-          : await this.api.get<VimeoResponse<VimeoFolder>>(nextUrl);
-        folders.push(...response.data.data);
-        nextUrl = response.data.paging.next;
+        const response = await this.apiRequest<VimeoResponse<VimeoFolder>>(nextUrl);
+        folders.push(...response.data);
+        nextUrl = response.paging.next;
       } catch (error) {
         console.warn('Warning: Could not fetch folders. Continuing without folder structure.');
         break;
@@ -93,13 +125,11 @@ export class VimeoDownloader {
     while (nextUrl) {
       try {
         const response = await RetryUtil.withRetry(
-          () => nextUrl!.startsWith('http')
-            ? axios.get<VimeoResponse<VimeoVideo>>(nextUrl!, { headers: this.api.defaults.headers })
-            : this.api.get<VimeoResponse<VimeoVideo>>(nextUrl!),
+          () => this.apiRequest<VimeoResponse<VimeoVideo>>(nextUrl!),
           { maxRetries: 3, baseDelay: 2000, maxDelay: 10000 }
         );
-        videos.push(...response.data.data);
-        nextUrl = response.data.paging.next;
+        videos.push(...response.data);
+        nextUrl = response.paging.next;
         
         console.log(`📥 Fetched ${videos.length} videos so far...`);
       } catch (error) {
@@ -137,26 +167,26 @@ export class VimeoDownloader {
   private async getVideoDownloadInfo(video: VimeoVideo): Promise<{ url: string; filename: string; size: number } | null> {
     try {
       const videoId = video.uri.split('/').pop();
-      const response = await this.api.get(`/videos/${videoId}?fields=download,files`);
+      const response = await this.apiRequest<{ download?: any[]; files?: any[] }>(`/videos/${videoId}?fields=download,files`);
       
       // Optional debug logging (can be enabled for troubleshooting)
       if (process.env.DEBUG_VIMEO === 'true') {
         console.log(`\n🔍 Debug info for video: ${video.name}`);
-        console.log('Download array:', response.data.download ? response.data.download.length : 'null/undefined');
-        console.log('Files array:', response.data.files ? response.data.files.length : 'null/undefined');
+        console.log('Download array:', response.download ? response.download.length : 'null/undefined');
+        console.log('Files array:', response.files ? response.files.length : 'null/undefined');
         
-        if (response.data.download) {
-          console.log('Download options:', response.data.download.map((d: any) => `${d.public_name || d.quality} - ${d.type}`));
+        if (response.download) {
+          console.log('Download options:', response.download.map((d: any) => `${d.public_name || d.quality} - ${d.type}`));
         }
         
-        if (response.data.files) {
-          console.log('File options:', response.data.files.map((f: any) => `${f.quality} - ${f.type} - ${f.link?.includes('.m3u8') ? 'HLS' : 'Direct'}`));
+        if (response.files) {
+          console.log('File options:', response.files.map((f: any) => `${f.quality} - ${f.type} - ${f.link?.includes('.m3u8') ? 'HLS' : 'Direct'}`));
         }
       }
       
       // Prefer any direct download over streaming files
-      if (response.data.download && response.data.download.length > 0) {
-        const selectedDownload = this.selectQuality(response.data.download);
+      if (response.download && response.download.length > 0) {
+        const selectedDownload = this.selectQuality(response.download);
         
         if (selectedDownload) {
           if (process.env.DEBUG_VIMEO === 'true') {
@@ -171,9 +201,9 @@ export class VimeoDownloader {
       }
       
       // Fallback to highest quality direct file (avoid HLS)
-      if (response.data.files && response.data.files.length > 0) {
+      if (response.files && response.files.length > 0) {
         // Filter out HLS files and prefer direct downloads
-        const directFiles = response.data.files.filter((f: any) => 
+        const directFiles = response.files.filter((f: any) => 
           f.quality !== 'hls' && !f.link?.includes('.m3u8')
         );
         
@@ -193,7 +223,7 @@ export class VimeoDownloader {
         }
         
         // Last resort: use HLS (this should rarely happen now)
-        const hlsFile = response.data.files.find((f: any) => f.quality === 'hls');
+        const hlsFile = response.files.find((f: any) => f.quality === 'hls');
         if (hlsFile) {
           console.log('⚠️  Only HLS available for', video.name, '- will download M3U8 playlist');
           return {
@@ -283,9 +313,9 @@ export class VimeoDownloader {
     const { downloadUrl, filePath, video } = job;
     
     // Check if file already exists
-    if (await fs.pathExists(filePath)) {
+    if (existsSync(filePath)) {
       if (!this.config.overwrite) {
-        const stats = await fs.stat(filePath);
+        const stats = statSync(filePath);
         if (stats.size > 0) {
           console.log(`⏭️  Skipping ${video.name} (already exists)`);
           return;
@@ -296,57 +326,103 @@ export class VimeoDownloader {
     }
     
     // Ensure directory exists
-    await fs.ensureDir(path.dirname(filePath));
+    mkdirSync(path.dirname(filePath), { recursive: true });
     
     console.log(`📥 (${current}/${total}) Downloading: ${video.name}`);
     
+    // Start progress tracking
+    const trackingId = video.uri;
+    this.progressTracker.startDownload(trackingId, job.size, video.name);
+    
     await RetryUtil.withRetry(
       async () => {
-        const response = await axios({
-          method: 'GET',
-          url: downloadUrl,
-          responseType: 'stream',
-          timeout: 60000, // 60 second timeout
+        const response = await fetch(downloadUrl, {
+          signal: AbortSignal.timeout(300000), // 5 minute timeout for downloads
         });
         
-        const totalSize = parseInt(response.headers['content-length'] || '0');
+        if (!response.ok) {
+          if (response.status === 403) {
+            throw new Error(`Download link expired or access denied for ${video.name}`);
+          }
+          if (response.status === 404) {
+            throw new Error(`Video file not found for ${video.name}`);
+          }
+          throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+        }
+        
+        if (!response.body) {
+          throw new Error('No response body available for download');
+        }
+        
+        const totalSize = parseInt(response.headers.get('content-length') || '0');
         let downloadedSize = 0;
         let lastProgress = -1;
         
-        const writer = fs.createWriteStream(filePath);
+        // Use Bun's file writer for better performance
+        const file = Bun.file(filePath);
+        const writer = file.writer();
         
-        // Track download progress
-        response.data.on('data', (chunk: Buffer) => {
-          downloadedSize += chunk.length;
-          const progress = Math.round((downloadedSize / totalSize) * 100);
-          
-          // Only log progress every 10% to avoid spam
-          if (progress !== lastProgress && progress % 10 === 0) {
-            const downloadedMB = (downloadedSize / (1024 * 1024)).toFixed(1);
-            const totalMB = (totalSize / (1024 * 1024)).toFixed(1);
-            console.log(`📥 (${current}/${total}) ${video.name} - ${progress}% (${downloadedMB}/${totalMB} MB)`);
-            lastProgress = progress;
+        const reader = response.body.getReader();
+        
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            
+            if (done) break;
+            
+            downloadedSize += value.length;
+            
+            // Update progress tracker
+            this.progressTracker.updateProgress(trackingId, downloadedSize);
+            
+            const progress = Math.round((downloadedSize / totalSize) * 100);
+            
+            // Only log progress every 10% to avoid spam
+            if (progress !== lastProgress && progress % 10 === 0) {
+              const progressInfo = this.progressTracker.formatProgress(trackingId);
+              console.log(`📥 (${current}/${total}) ${video.name} - ${progressInfo}`);
+              lastProgress = progress;
+            }
+            
+            writer.write(value);
           }
-        });
-        
-        response.data.pipe(writer);
-        
-        return new Promise<void>((resolve, reject) => {
-          writer.on('finish', () => {
-            console.log(`✅ (${current}/${total}) ${video.name} - Complete`);
-            resolve();
-          });
-          writer.on('error', (error) => {
-            // Clean up partial file on error
-            fs.unlink(filePath).catch(() => {});
-            reject(error);
-          });
-          response.data.on('error', (error) => {
-            writer.destroy();
-            fs.unlink(filePath).catch(() => {});
-            reject(error);
-          });
-        });
+          
+          await writer.end();
+          
+          // Verify file was written correctly
+          if (totalSize > 0) {
+            const actualSize = statSync(filePath).size;
+            if (actualSize !== totalSize) {
+              throw new Error(`File size mismatch: expected ${totalSize}, got ${actualSize}`);
+            }
+          }
+          
+          this.progressTracker.completeDownload(trackingId);
+          console.log(`✅ (${current}/${total}) ${video.name} - Complete`);
+        } catch (error) {
+          try {
+            await writer.end();
+          } catch {
+            // Ignore writer end errors
+          }
+          try { 
+            unlinkSync(filePath); 
+          } catch {
+            // Ignore cleanup errors
+          }
+          
+          if (error instanceof Error) {
+            if (error.name === 'TimeoutError') {
+              throw new Error(`Download timeout for ${video.name}`);
+            }
+            if (error.name === 'AbortError') {
+              throw new Error(`Download aborted for ${video.name}`);
+            }
+          }
+          throw error;
+        } finally {
+          reader.releaseLock();
+        }
       },
       { maxRetries: 2, baseDelay: 5000, maxDelay: 15000 }
     );
@@ -398,5 +474,28 @@ export class VimeoDownloader {
     if (bytes === 0) return '0 Bytes';
     const i = Math.floor(Math.log(bytes) / Math.log(1024));
     return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
+  }
+
+  private printDownloadSummary(): void {
+    const allProgress = this.progressTracker.getAllProgress();
+    const completedDownloads = allProgress.filter(p => p.completed);
+    
+    if (completedDownloads.length === 0) return;
+    
+    const totalSize = completedDownloads.reduce((sum, p) => sum + p.totalSize, 0);
+    const totalDuration = completedDownloads.reduce((max, p) => {
+      const duration = p.endTime ? p.endTime - p.startTime : 0;
+      return Math.max(max, duration);
+    }, 0);
+    
+    console.log('\n📊 Download Summary:');
+    console.log(`   Total files: ${completedDownloads.length}`);
+    console.log(`   Total size: ${this.formatFileSize(totalSize)}`);
+    console.log(`   Total time: ${Math.round(totalDuration / 1000)}s`);
+    
+    if (totalDuration > 0) {
+      const avgSpeed = totalSize / (totalDuration / 1000);
+      console.log(`   Average speed: ${this.formatFileSize(avgSpeed)}/s`);
+    }
   }
 }

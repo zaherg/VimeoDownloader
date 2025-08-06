@@ -1,11 +1,8 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
-import dotenv from 'dotenv';
 import { VimeoDownloader } from './src/VimeoDownloader';
 import { Config } from './src/types';
-
-dotenv.config();
 
 const program = new Command();
 
