@@ -62,7 +62,7 @@ export class ProgressTracker {
   }
 }
 
-interface DownloadProgress {
+export interface DownloadProgress {
   id: string;
   filename: string;
   totalSize: number;

@@ -1,7 +1,10 @@
 import { existsSync, mkdirSync, unlinkSync, statSync } from 'fs';
 import path from 'path';
+import React from 'react';
+import { render } from 'ink';
 import { Config, VimeoVideo, VimeoFolder, VimeoResponse, DownloadJob } from './types';
 import { ProgressTracker } from './ProgressTracker';
+import { ProgressDisplay } from './ProgressDisplay';
 import { Semaphore } from './Semaphore';
 import { RetryUtil } from './RetryUtil';
 
@@ -10,6 +13,7 @@ export class VimeoDownloader {
   private headers: Record<string, string>;
   private config: Config;
   private progressTracker: ProgressTracker;
+  private progressDisplay: any = null;
 
   constructor(config: Config) {
     this.config = config;
@@ -29,12 +33,19 @@ export class VimeoDownloader {
       const folders = await this.getAllFolders();
       const videos = await this.getAllVideos();
       
-      console.log(`📁 Found ${folders.length} folders`);
-      console.log(`🎥 Found ${videos.length} videos`);
+      if (process.env.DEBUG_VIMEO === 'true') {
+        console.log(`📁 Found ${folders.length} folders`);
+        console.log(`🎥 Found ${videos.length} videos`);
+      }
       
       mkdirSync(this.config.downloadPath, { recursive: true });
       
       const downloadJobs = await this.prepareDownloadJobs(videos);
+      
+      if (downloadJobs.length === 0) {
+        console.log('\n❌ No videos available for download.');
+        return;
+      }
       
       if (this.config.dryRun) {
         console.log('\n🔍 Dry run mode - showing what would be downloaded:');
@@ -42,10 +53,12 @@ export class VimeoDownloader {
         return;
       }
       
-      await this.downloadVideos(downloadJobs);
+      const { actualDownloads } = await this.downloadVideos(downloadJobs);
       
-      console.log('\n✅ Download process completed!');
-      this.printDownloadSummary();
+      // Only show download summary if files were actually downloaded
+      if (actualDownloads > 0) {
+        this.printDownloadSummary(actualDownloads);
+      }
     } catch (error) {
       console.error('❌ Error during download process:', error);
       throw error;
@@ -91,10 +104,14 @@ export class VimeoDownloader {
   private async verifyAuthentication(): Promise<void> {
     try {
       const response = await RetryUtil.withRetry(
-        () => this.apiRequest<{ name: string }>('/me'),
+        () => this.apiRequest<{ name: string; account: string; metadata?: { connections?: any } }>('/me?fields=name,account,metadata.connections'),
         { maxRetries: 2, baseDelay: 1000, maxDelay: 5000 }
       );
-      console.log(`✅ Authenticated as: ${response.name}`);
+      if (process.env.DEBUG_VIMEO === 'true') {
+        console.log(`✅ Authenticated as: ${response.name}`);
+        console.log('Account type:', response.account);
+        console.log('Available connections:', Object.keys(response.metadata?.connections || {}));
+      }
     } catch (error) {
       throw new Error('Failed to authenticate with Vimeo API. Check your access token.');
     }
@@ -131,7 +148,9 @@ export class VimeoDownloader {
         videos.push(...response.data);
         nextUrl = response.paging.next;
         
-        console.log(`📥 Fetched ${videos.length} videos so far...`);
+        if (process.env.DEBUG_VIMEO === 'true') {
+          console.log(`📥 Fetched ${videos.length} videos so far...`);
+        }
       } catch (error) {
         console.error('Error fetching videos:', error instanceof Error ? error.message : error);
         break;
@@ -143,6 +162,7 @@ export class VimeoDownloader {
 
   private async prepareDownloadJobs(videos: VimeoVideo[]): Promise<DownloadJob[]> {
     const jobs: DownloadJob[] = [];
+    const failedVideos: string[] = [];
     
     for (const video of videos) {
       try {
@@ -155,10 +175,22 @@ export class VimeoDownloader {
             filePath,
             size: downloadInfo.size,
           });
+        } else {
+          failedVideos.push(video.name);
         }
       } catch (error) {
-        console.warn(`⚠️  Could not get download info for video: ${video.name}`);
+        failedVideos.push(video.name);
       }
+    }
+    
+    // Show failed videos summary if any
+    if (failedVideos.length > 0) {
+      console.warn(`\n⚠️  ${failedVideos.length} video${failedVideos.length > 1 ? 's' : ''} could not be downloaded:`);
+      failedVideos.forEach(name => console.warn(`   • ${name}`));
+      console.warn(`\n   This might be due to:`);
+      console.warn(`   1. Video download not enabled in Vimeo settings`);
+      console.warn(`   2. Access token missing download permissions`);
+      console.warn(`   3. Video privacy settings restricting downloads`);
     }
     
     return jobs;
@@ -167,6 +199,12 @@ export class VimeoDownloader {
   private async getVideoDownloadInfo(video: VimeoVideo): Promise<{ url: string; filename: string; size: number } | null> {
     try {
       const videoId = video.uri.split('/').pop();
+      
+      if (process.env.DEBUG_VIMEO === 'true') {
+        console.log(`\n🔍 Requesting download info for video ID: ${videoId}`);
+        console.log(`Full video URI: ${video.uri}`);
+      }
+      
       const response = await this.apiRequest<{ download?: any[]; files?: any[] }>(`/videos/${videoId}?fields=download,files`);
       
       // Optional debug logging (can be enabled for troubleshooting)
@@ -182,6 +220,11 @@ export class VimeoDownloader {
         if (response.files) {
           console.log('File options:', response.files.map((f: any) => `${f.quality} - ${f.type} - ${f.link?.includes('.m3u8') ? 'HLS' : 'Direct'}`));
         }
+      }
+      
+      // Check if this is a permission issue
+      if (!response.download && !response.files) {
+        return null;
       }
       
       // Prefer any direct download over streaming files
@@ -287,30 +330,70 @@ export class VimeoDownloader {
     });
   }
 
-  private async downloadVideos(jobs: DownloadJob[]): Promise<void> {
+  private async downloadVideos(jobs: DownloadJob[]): Promise<{ actualDownloads: number; skippedFiles: number }> {
     console.log(`\n📥 Starting download of ${jobs.length} videos...`);
     
+    // Start the progress display
+    this.progressDisplay = render(
+      React.createElement(ProgressDisplay, {
+        progressTracker: this.progressTracker,
+        maxConcurrentDownloads: this.config.maxConcurrentDownloads
+      })
+    );
+    
     const semaphore = new Semaphore(this.config.maxConcurrentDownloads);
-    let completedJobs = 0;
+    let actualDownloads = 0;
+    let skippedFiles = 0;
     
     const downloadPromises = jobs.map(async (job, index) => {
       await semaphore.acquire();
       
       try {
-        await this.downloadSingleVideo(job, index + 1, jobs.length);
-        completedJobs++;
+        const result = await this.downloadSingleVideo(job, index + 1, jobs.length);
+        if (result === 'downloaded') {
+          actualDownloads++;
+        } else if (result === 'skipped') {
+          skippedFiles++;
+        }
+        // 'failed' downloads are not counted in either category
       } catch (error) {
-        console.error(`❌ Failed to download ${job.video.name}:`, error instanceof Error ? error.message : error);
+        // Progress display will show the error, but still log it for debugging
+        if (process.env.DEBUG_VIMEO === 'true') {
+          console.error(`❌ Failed to download ${job.video.name}:`, error instanceof Error ? error.message : error);
+        }
       } finally {
         semaphore.release();
       }
     });
     
     await Promise.all(downloadPromises);
+    
+    // Stop the progress display
+    if (this.progressDisplay) {
+      this.progressDisplay.unmount();
+      this.progressDisplay = null;
+    }
+    
+    // Show appropriate completion message
+    if (actualDownloads === 0) {
+      if (skippedFiles > 0) {
+        console.log(`\n📁 Nothing to download - all ${skippedFiles} files already exist.`);
+      } else {
+        console.log(`\n❌ No files were downloaded.`);
+      }
+    } else {
+      console.log(`\n✅ Downloaded ${actualDownloads} file${actualDownloads > 1 ? 's' : ''}!${skippedFiles > 0 ? ` (${skippedFiles} already existed)` : ''}`);
+    }
+    
+    return { actualDownloads, skippedFiles };
   }
 
-  private async downloadSingleVideo(job: DownloadJob, current: number, total: number): Promise<void> {
+  private async downloadSingleVideo(job: DownloadJob, current: number, total: number): Promise<'downloaded' | 'skipped' | 'failed'> {
     const { downloadUrl, filePath, video } = job;
+    
+    // Start progress tracking for all files (including skipped ones)
+    const trackingId = video.uri;
+    this.progressTracker.startDownload(trackingId, job.size, video.name);
     
     // Check if file already exists
     if (existsSync(filePath)) {
@@ -318,7 +401,10 @@ export class VimeoDownloader {
         const stats = statSync(filePath);
         if (stats.size > 0) {
           console.log(`⏭️  Skipping ${video.name} (already exists)`);
-          return;
+          // Mark as completed immediately for skipped files
+          this.progressTracker.updateProgress(trackingId, job.size);
+          this.progressTracker.completeDownload(trackingId);
+          return 'skipped';
         }
       } else {
         console.log(`🔄 Overwriting ${video.name}`);
@@ -327,12 +413,6 @@ export class VimeoDownloader {
     
     // Ensure directory exists
     mkdirSync(path.dirname(filePath), { recursive: true });
-    
-    console.log(`📥 (${current}/${total}) Downloading: ${video.name}`);
-    
-    // Start progress tracking
-    const trackingId = video.uri;
-    this.progressTracker.startDownload(trackingId, job.size, video.name);
     
     await RetryUtil.withRetry(
       async () => {
@@ -372,17 +452,8 @@ export class VimeoDownloader {
             
             downloadedSize += value.length;
             
-            // Update progress tracker
+            // Update progress tracker (the UI will automatically update)
             this.progressTracker.updateProgress(trackingId, downloadedSize);
-            
-            const progress = Math.round((downloadedSize / totalSize) * 100);
-            
-            // Only log progress every 10% to avoid spam
-            if (progress !== lastProgress && progress % 10 === 0) {
-              const progressInfo = this.progressTracker.formatProgress(trackingId);
-              console.log(`📥 (${current}/${total}) ${video.name} - ${progressInfo}`);
-              lastProgress = progress;
-            }
             
             writer.write(value);
           }
@@ -398,7 +469,6 @@ export class VimeoDownloader {
           }
           
           this.progressTracker.completeDownload(trackingId);
-          console.log(`✅ (${current}/${total}) ${video.name} - Complete`);
         } catch (error) {
           try {
             await writer.end();
@@ -426,6 +496,8 @@ export class VimeoDownloader {
       },
       { maxRetries: 2, baseDelay: 5000, maxDelay: 15000 }
     );
+    
+    return 'downloaded';
   }
 
   private selectQuality(downloads: any[]): any | null {
@@ -476,20 +548,30 @@ export class VimeoDownloader {
     return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
   }
 
-  private printDownloadSummary(): void {
+  private printDownloadSummary(actualDownloadCount: number): void {
+    if (actualDownloadCount === 0) return;
+    
     const allProgress = this.progressTracker.getAllProgress();
-    const completedDownloads = allProgress.filter(p => p.completed);
+    // Filter to only files that were actually downloaded (not skipped)
+    // We can identify these as files that have meaningful download duration
+    const actualDownloads = allProgress.filter(p => {
+      if (!p.completed) return false;
+      
+      const duration = p.endTime ? p.endTime - p.startTime : 0;
+      // If download took more than 100ms, it was actually downloaded (not skipped)
+      return duration > 100;
+    });
     
-    if (completedDownloads.length === 0) return;
+    if (actualDownloads.length === 0) return;
     
-    const totalSize = completedDownloads.reduce((sum, p) => sum + p.totalSize, 0);
-    const totalDuration = completedDownloads.reduce((max, p) => {
+    const totalSize = actualDownloads.reduce((sum, p) => sum + p.totalSize, 0);
+    const totalDuration = actualDownloads.reduce((max, p) => {
       const duration = p.endTime ? p.endTime - p.startTime : 0;
       return Math.max(max, duration);
     }, 0);
     
     console.log('\n📊 Download Summary:');
-    console.log(`   Total files: ${completedDownloads.length}`);
+    console.log(`   Total files: ${actualDownloads.length}`);
     console.log(`   Total size: ${this.formatFileSize(totalSize)}`);
     console.log(`   Total time: ${Math.round(totalDuration / 1000)}s`);
     

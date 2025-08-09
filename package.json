@@ -11,6 +11,10 @@
   },
   "scripts": {
     "dev": "bun run index.ts",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "build": "bun build index.ts --outdir dist --target node",
     "build:exe": "bun build index.ts --compile --outfile vimeo-downloader",
     "build:exe-win": "bun build index.ts --compile --target=bun-windows-x64 --outfile vimeo-downloader.exe",
@@ -21,12 +25,20 @@
     "start": "bun run dist/index.js"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@testing-library/jest-dom": "^6.6.4",
+    "@testing-library/react": "^16.3.0",
+    "@types/bun": "latest",
+    "@vitest/ui": "^3.2.4",
+    "happy-dom": "^18.0.1",
+    "vitest": "^3.2.4"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "commander": "^14.0.0"
+    "@types/react": "^19.1.9",
+    "commander": "^14.0.0",
+    "ink": "^6.1.0",
+    "react": "^19.1.1"
   }
 }
