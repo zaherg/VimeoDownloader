@@ -6,7 +6,8 @@ import { Config, VimeoVideo, VimeoFolder, VimeoResponse, DownloadJob } from './t
 import { ProgressTracker } from './ProgressTracker';
 import { ProgressDisplay } from './ProgressDisplay';
 import { Semaphore } from './Semaphore';
-import { RetryUtil } from './RetryUtil';
+import { RetryUtil, NetworkError } from './RetryUtil';
+import { ErrorHandler } from './ErrorHandler';
 
 export class VimeoDownloader {
   private baseUrl = 'https://api.vimeo.com';
@@ -21,7 +22,7 @@ export class VimeoDownloader {
       'Authorization': `Bearer ${config.accessToken}`,
       'Accept': 'application/vnd.vimeo.*+json;version=3.4',
     };
-    this.progressTracker = new ProgressTracker();
+    this.progressTracker = new ProgressTracker(config.downloadPath);
   }
 
   async start(): Promise<void> {
@@ -60,7 +61,21 @@ export class VimeoDownloader {
         this.printDownloadSummary(actualDownloads);
       }
     } catch (error) {
-      console.error('❌ Error during download process:', error);
+      const guidance = ErrorHandler.classifyError(error instanceof Error ? error : new Error(String(error)));
+      console.error('❌ Critical error during download process:');
+      console.error(ErrorHandler.formatErrorGuidance(guidance));
+      
+      // Show summary of incomplete downloads for user recovery
+      const incompleteDownloads = this.progressTracker.getIncompleteDownloads();
+      if (incompleteDownloads.length > 0) {
+        console.log(`\n📋 ${incompleteDownloads.length} download(s) were interrupted and can be resumed:`);
+        incompleteDownloads.forEach((download, index) => {
+          const progress = Math.round((download.downloadedSize / download.totalSize) * 100);
+          console.log(`   ${index + 1}. ${download.filename} (${progress}% complete)`);
+        });
+        console.log('\n💡 Run the command again to resume interrupted downloads.\n');
+      }
+      
       throw error;
     }
   }
@@ -69,32 +84,58 @@ export class VimeoDownloader {
     const url = endpoint.startsWith('http') ? endpoint : `${this.baseUrl}${endpoint}`;
     
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      
       const response = await fetch(url, {
         headers: this.headers,
-        signal: AbortSignal.timeout(30000), // 30 second timeout
+        signal: controller.signal,
       });
       
+      clearTimeout(timeoutId);
+      
       if (!response.ok) {
+        // Extract retry-after header for rate limiting
+        const retryAfter = response.headers.get('retry-after');
+        const retryAfterSeconds = retryAfter ? parseInt(retryAfter) : undefined;
+        
         if (response.status === 401) {
-          throw new Error('Authentication failed. Please check your access token.');
+          throw RetryUtil.createNetworkError('Authentication failed. Please check your access token.', 401, undefined, 'AUTH_ERROR');
         }
         if (response.status === 403) {
-          throw new Error('Access forbidden. Please check your permissions.');
+          throw RetryUtil.createNetworkError('Access forbidden. Please check your permissions.', 403, undefined, 'PERMISSION_ERROR');
         }
         if (response.status === 429) {
-          throw new Error('Rate limited. Please wait before retrying.');
+          throw RetryUtil.createNetworkError('Rate limited. Please wait before retrying.', 429, retryAfterSeconds, 'RATE_LIMIT');
         }
-        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+        if (response.status >= 500) {
+          throw RetryUtil.createNetworkError(`Server error: ${response.status} ${response.statusText}`, response.status, undefined, 'SERVER_ERROR');
+        }
+        throw RetryUtil.createNetworkError(`API request failed: ${response.status} ${response.statusText}`, response.status, undefined, 'API_ERROR');
+      }
+      
+      // Validate response content type
+      const contentType = response.headers.get('content-type');
+      if (!contentType || !contentType.includes('application/json')) {
+        throw RetryUtil.createNetworkError('Invalid response format - expected JSON', response.status, undefined, 'INVALID_RESPONSE');
       }
       
       return await response.json();
     } catch (error) {
       if (error instanceof Error) {
-        if (error.name === 'TimeoutError') {
-          throw new Error(`Request timeout for ${url}`);
+        if (error.name === 'AbortError') {
+          throw RetryUtil.createNetworkError(`Request timeout for ${url} (30s)`, 0, undefined, 'TIMEOUT');
         }
-        if (error.name === 'TypeError' && error.message.includes('fetch')) {
-          throw new Error(`Network error: Unable to reach ${url}`);
+        if (error.name === 'TypeError') {
+          if (error.message.includes('fetch') || error.message.includes('network')) {
+            throw RetryUtil.createNetworkError(`Network connection failed: Unable to reach ${url}`, 0, undefined, 'CONNECTION_FAILED');
+          }
+          if (error.message.includes('Failed to parse')) {
+            throw RetryUtil.createNetworkError('Invalid JSON response from server', 0, undefined, 'PARSE_ERROR');
+          }
+        }
+        if (error.message.includes('ENOTFOUND') || error.message.includes('ECONNREFUSED')) {
+          throw RetryUtil.createNetworkError(`DNS or connection error: ${error.message}`, 0, undefined, 'CONNECTION_FAILED');
         }
       }
       throw error;
@@ -113,7 +154,10 @@ export class VimeoDownloader {
         console.log('Available connections:', Object.keys(response.metadata?.connections || {}));
       }
     } catch (error) {
-      throw new Error('Failed to authenticate with Vimeo API. Check your access token.');
+      const guidance = ErrorHandler.classifyError(error instanceof Error ? error : new Error('Authentication failed'));
+      console.error('Authentication Error:');
+      console.error(ErrorHandler.formatErrorGuidance(guidance));
+      throw error;
     }
   }
 
@@ -143,7 +187,14 @@ export class VimeoDownloader {
       try {
         const response = await RetryUtil.withRetry(
           () => this.apiRequest<VimeoResponse<VimeoVideo>>(nextUrl!),
-          { maxRetries: 3, baseDelay: 2000, maxDelay: 10000 }
+          { 
+            maxRetries: 3, 
+            baseDelay: 2000, 
+            maxDelay: 10000,
+            onRetry: (attempt, error) => {
+              console.log(`⚠️  Retrying video fetch (${attempt}/3): ${error.message}`);
+            }
+          }
         );
         videos.push(...response.data);
         nextUrl = response.paging.next;
@@ -152,7 +203,13 @@ export class VimeoDownloader {
           console.log(`📥 Fetched ${videos.length} videos so far...`);
         }
       } catch (error) {
-        console.error('Error fetching videos:', error instanceof Error ? error.message : error);
+        const guidance = ErrorHandler.classifyError(error instanceof Error ? error : new Error(String(error)));
+        console.error('❌ Error fetching videos:');
+        console.error(ErrorHandler.formatErrorGuidance(guidance));
+        
+        if (!guidance.recoverable) {
+          throw error;
+        }
         break;
       }
     }
@@ -180,6 +237,11 @@ export class VimeoDownloader {
         }
       } catch (error) {
         failedVideos.push(video.name);
+        if (process.env.DEBUG_VIMEO === 'true') {
+          const guidance = ErrorHandler.classifyError(error instanceof Error ? error : new Error(String(error)));
+          console.debug(`Failed to get download info for ${video.name}:`);
+          console.debug(ErrorHandler.formatErrorGuidance(guidance));
+        }
       }
     }
     
@@ -205,7 +267,19 @@ export class VimeoDownloader {
         console.log(`Full video URI: ${video.uri}`);
       }
       
-      const response = await this.apiRequest<{ download?: any[]; files?: any[] }>(`/videos/${videoId}?fields=download,files`);
+      const response = await RetryUtil.withRetry(
+        () => this.apiRequest<{ download?: any[]; files?: any[] }>(`/videos/${videoId}?fields=download,files`),
+        {
+          maxRetries: 2,
+          baseDelay: 1000,
+          maxDelay: 5000,
+          onRetry: (attempt, error) => {
+            if (process.env.DEBUG_VIMEO === 'true') {
+              console.log(`⚠️  Retrying download info for ${video.name} (${attempt}/2): ${error.message}`);
+            }
+          }
+        }
+      );
       
       // Optional debug logging (can be enabled for troubleshooting)
       if (process.env.DEBUG_VIMEO === 'true') {
@@ -357,9 +431,14 @@ export class VimeoDownloader {
         }
         // 'failed' downloads are not counted in either category
       } catch (error) {
-        // Progress display will show the error, but still log it for debugging
+        const guidance = ErrorHandler.classifyError(error instanceof Error ? error : new Error(String(error)));
+        this.progressTracker.failDownload(trackingId, guidance.userMessage);
+        
         if (process.env.DEBUG_VIMEO === 'true') {
-          console.error(`❌ Failed to download ${job.video.name}:`, error instanceof Error ? error.message : error);
+          console.error(`❌ Failed to download ${job.video.name}:`);
+          console.error(ErrorHandler.formatErrorGuidance(guidance));
+        } else {
+          console.error(`❌ ${job.video.name}: ${guidance.userMessage}`);
         }
       } finally {
         semaphore.release();
@@ -385,6 +464,9 @@ export class VimeoDownloader {
       console.log(`\n✅ Downloaded ${actualDownloads} file${actualDownloads > 1 ? 's' : ''}!${skippedFiles > 0 ? ` (${skippedFiles} already existed)` : ''}`);
     }
     
+    // Show recovery guidance for any failed or incomplete downloads
+    this.showRecoveryGuidance();
+    
     return { actualDownloads, skippedFiles };
   }
 
@@ -395,19 +477,53 @@ export class VimeoDownloader {
     const trackingId = video.uri;
     this.progressTracker.startDownload(trackingId, job.size, video.name);
     
-    // Check if file already exists
+    let resumeFrom = 0;
+    let tempFilePath = filePath + '.partial';
+    
+    // Check if file already exists and is complete
     if (existsSync(filePath)) {
       if (!this.config.overwrite) {
         const stats = statSync(filePath);
-        if (stats.size > 0) {
-          console.log(`⏭️  Skipping ${video.name} (already exists)`);
-          // Mark as completed immediately for skipped files
-          this.progressTracker.updateProgress(trackingId, job.size);
+        if (stats.size === job.size || (job.size === 0 && stats.size > 0)) {
+          console.log(`⏭️  Skipping ${video.name} (already complete)`);
+          this.progressTracker.updateProgress(trackingId, job.size || stats.size);
           this.progressTracker.completeDownload(trackingId);
           return 'skipped';
         }
       } else {
         console.log(`🔄 Overwriting ${video.name}`);
+        // Remove existing file to start fresh
+        try {
+          unlinkSync(filePath);
+        } catch {}
+      }
+    }
+    
+    // Check for partial download that can be resumed
+    if (existsSync(tempFilePath)) {
+      const stats = statSync(tempFilePath);
+      if (stats.size > 0 && stats.size < job.size) {
+        resumeFrom = stats.size;
+        console.log(`📁 Resuming ${video.name} from ${this.formatFileSize(resumeFrom)}`);
+        this.progressTracker.updateProgress(trackingId, resumeFrom);
+      } else if (stats.size >= job.size) {
+        // Partial file is complete, just rename it
+        try {
+          const fs = require('fs');
+          fs.renameSync(tempFilePath, filePath);
+          console.log(`✅ Completed ${video.name} (was partial)`);
+          this.progressTracker.updateProgress(trackingId, job.size);
+          this.progressTracker.completeDownload(trackingId);
+          return 'downloaded';
+        } catch (error) {
+          // If rename fails, delete and start over
+          try { unlinkSync(tempFilePath); } catch {}
+          resumeFrom = 0;
+        }
+      } else {
+        // Invalid partial file, delete and start over
+        try { unlinkSync(tempFilePath); } catch {}
+        resumeFrom = 0;
       }
     }
     
@@ -416,33 +532,74 @@ export class VimeoDownloader {
     
     await RetryUtil.withRetry(
       async () => {
+        const headers: Record<string, string> = {};
+        if (resumeFrom > 0) {
+          headers['Range'] = `bytes=${resumeFrom}-`;
+        }
+        
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minute timeout
+        
         const response = await fetch(downloadUrl, {
-          signal: AbortSignal.timeout(300000), // 5 minute timeout for downloads
+          headers,
+          signal: controller.signal,
         });
+        
+        clearTimeout(timeoutId);
         
         if (!response.ok) {
           if (response.status === 403) {
-            throw new Error(`Download link expired or access denied for ${video.name}`);
+            throw RetryUtil.createNetworkError(`Download link expired or access denied for ${video.name}`, 403, undefined, 'PERMISSION_ERROR');
           }
           if (response.status === 404) {
-            throw new Error(`Video file not found for ${video.name}`);
+            throw RetryUtil.createNetworkError(`Video file not found for ${video.name}`, 404, undefined, 'API_ERROR');
           }
-          throw new Error(`Download failed: ${response.status} ${response.statusText}`);
+          if (response.status === 416) {
+            // Range not satisfiable - file might be corrupted, start over
+            console.log(`⚠️  Invalid resume range for ${video.name}, starting over`);
+            try { unlinkSync(tempFilePath); } catch {}
+            resumeFrom = 0;
+            throw RetryUtil.createNetworkError('Range not satisfiable, retrying from beginning', 416, undefined, 'SERVER_ERROR');
+          }
+          if (response.status === 429) {
+            const retryAfter = response.headers.get('retry-after');
+            throw RetryUtil.createNetworkError('Rate limited during download', 429, retryAfter ? parseInt(retryAfter) : undefined, 'RATE_LIMIT');
+          }
+          throw RetryUtil.createNetworkError(`Download failed: ${response.status} ${response.statusText}`, response.status, undefined, 'API_ERROR');
         }
         
         if (!response.body) {
           throw new Error('No response body available for download');
         }
         
-        const totalSize = parseInt(response.headers.get('content-length') || '0');
-        let downloadedSize = 0;
-        let lastProgress = -1;
+        // Handle partial content responses
+        const isPartialContent = response.status === 206;
+        const contentLength = parseInt(response.headers.get('content-length') || '0');
+        const totalSize = isPartialContent ? resumeFrom + contentLength : contentLength;
+        let downloadedSize = resumeFrom;
+        
+        // Validate that we can resume properly
+        if (resumeFrom > 0 && !isPartialContent) {
+          console.log(`⚠️  Server doesn't support resume for ${video.name}, starting over`);
+          try { unlinkSync(tempFilePath); } catch {}
+          resumeFrom = 0;
+          downloadedSize = 0;
+          // Re-throw to retry without range header
+          throw RetryUtil.createNetworkError('Resume not supported, retrying from beginning', 200, undefined, 'SERVER_ERROR');
+        }
         
         // Use Bun's file writer for better performance
-        const file = Bun.file(filePath);
-        const writer = file.writer();
+        const file = Bun.file(tempFilePath);
+        const writer = resumeFrom > 0 ? file.writer({ highWaterMark: 64 * 1024 }) : file.writer();
         
-        const reader = response.body.getReader();
+        // If resuming, seek to the end of existing content
+        if (resumeFrom > 0) {
+          // For Bun, we need to append to existing file
+          const existingData = await Bun.file(tempFilePath).arrayBuffer();
+          writer.write(new Uint8Array(existingData));
+        }
+        
+        const reader = response.body!.getReader();
         
         try {
           while (true) {
@@ -461,12 +618,16 @@ export class VimeoDownloader {
           await writer.end();
           
           // Verify file was written correctly
-          if (totalSize > 0) {
-            const actualSize = statSync(filePath).size;
-            if (actualSize !== totalSize) {
-              throw new Error(`File size mismatch: expected ${totalSize}, got ${actualSize}`);
-            }
+          const actualSize = statSync(tempFilePath).size;
+          const expectedSize = job.size || totalSize;
+          
+          if (expectedSize > 0 && actualSize !== expectedSize) {
+            throw new Error(`File size mismatch: expected ${expectedSize}, got ${actualSize}`);
           }
+          
+          // Move completed file from temp to final location
+          const fs = require('fs');
+          fs.renameSync(tempFilePath, filePath);
           
           this.progressTracker.completeDownload(trackingId);
         } catch (error) {
@@ -475,8 +636,13 @@ export class VimeoDownloader {
           } catch {
             // Ignore writer end errors
           }
-          try { 
-            unlinkSync(filePath); 
+          // Don't delete partial file - keep it for resume
+          // Only delete if the file is corrupted (very small)
+          try {
+            const stats = statSync(tempFilePath);
+            if (stats.size < 1024) { // Less than 1KB, probably corrupted
+              unlinkSync(tempFilePath);
+            }
           } catch {
             // Ignore cleanup errors
           }
@@ -494,7 +660,22 @@ export class VimeoDownloader {
           reader.releaseLock();
         }
       },
-      { maxRetries: 2, baseDelay: 5000, maxDelay: 15000 }
+      { 
+        maxRetries: 3, 
+        baseDelay: 2000, 
+        maxDelay: 30000,
+        enableJitter: true,
+        backoffMultiplier: 2,
+        retryOnStatus: [429, 500, 502, 503, 504, 416], // Include 416 for range errors
+        onRetry: (attempt, error) => {
+          console.log(`⚠️  Retrying download for ${video.name} (${attempt}/3): ${error.message}`);
+          // Reset resume position on certain errors
+          const networkError = error as any;
+          if (networkError.status === 416) {
+            resumeFrom = 0;
+          }
+        }
+      }
     );
     
     return 'downloaded';
@@ -548,6 +729,28 @@ export class VimeoDownloader {
     return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
   }
 
+  private showRecoveryGuidance(): void {
+    const failedDownloads = this.progressTracker.getFailedDownloads();
+    const incompleteDownloads = this.progressTracker.getIncompleteDownloads();
+    
+    if (failedDownloads.length > 0) {
+      console.log(`\n⚠️  ${failedDownloads.length} download(s) failed:`);
+      failedDownloads.forEach((download, index) => {
+        console.log(`   ${index + 1}. ${download.filename} - ${download.errorMessage}`);
+      });
+      console.log('\n   Check error details above for specific resolution steps.');
+    }
+    
+    if (incompleteDownloads.length > 0) {
+      console.log(`\n📋 ${incompleteDownloads.length} download(s) were interrupted:`);
+      incompleteDownloads.forEach((download, index) => {
+        const progress = download.totalSize > 0 ? Math.round((download.downloadedSize / download.totalSize) * 100) : 0;
+        console.log(`   ${index + 1}. ${download.filename} (${progress}% complete)`);
+      });
+      console.log('\n💡 Run the command again to resume these downloads.');
+    }
+  }
+  
   private printDownloadSummary(actualDownloadCount: number): void {
     if (actualDownloadCount === 0) return;
     

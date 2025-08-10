@@ -1,13 +1,23 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { VimeoDownloader } from '../VimeoDownloader';
+import { RetryUtil } from '../RetryUtil';
+import { ErrorHandler } from '../ErrorHandler';
 import type { Config, VimeoVideo, VimeoFolder, VimeoDownloadLink } from '../types';
 
 // Mock external modules
 vi.mock('fs', () => ({
+  existsSync: vi.fn(),
+  mkdirSync: vi.fn(),
+  unlinkSync: vi.fn(),
+  statSync: vi.fn(),
+  renameSync: vi.fn(),
+}));
+
+// Mock path module
+vi.mock('path', () => ({
   default: {
-    existsSync: vi.fn(),
-    mkdirSync: vi.fn(),
-    createWriteStream: vi.fn(),
+    join: (...parts: string[]) => parts.join('/'),
+    dirname: (p: string) => p.split('/').slice(0, -1).join('/'),
   }
 }));
 
@@ -287,6 +297,9 @@ describe('VimeoDownloader', () => {
       const mockResponse = { data: 'test' };
       vi.mocked(fetch).mockResolvedValueOnce({
         ok: true,
+        headers: new Headers({
+          'content-type': 'application/json'
+        }),
         json: async () => mockResponse,
       } as Response);
 
@@ -297,22 +310,110 @@ describe('VimeoDownloader', () => {
         {
           headers: {
             'Authorization': 'Bearer test_access_token',
-            'User-Agent': 'VimeoDownloader/1.0',
             'Accept': 'application/vnd.vimeo.*+json;version=3.4',
           },
+          signal: expect.any(AbortSignal),
         }
       );
       expect(result).toEqual(mockResponse);
     });
 
-    it('should handle API errors', async () => {
+    it('should handle API errors with enhanced error types', async () => {
       vi.mocked(fetch).mockResolvedValueOnce({
         ok: false,
         status: 404,
         statusText: 'Not Found',
+        headers: new Headers(),
       } as Response);
 
-      await expect(downloader['apiRequest']('/test')).rejects.toThrow('API request failed: 404 Not Found');
+      await expect(downloader['apiRequest']('/test')).rejects.toMatchObject({
+        message: 'API request failed: 404 Not Found',
+        status: 404,
+        errorType: 'API_ERROR'
+      });
+    });
+
+    it('should handle authentication errors', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 401,
+        statusText: 'Unauthorized',
+        headers: new Headers(),
+      } as Response);
+
+      await expect(downloader['apiRequest']('/test')).rejects.toMatchObject({
+        message: 'Authentication failed. Please check your access token.',
+        status: 401,
+        errorType: 'AUTH_ERROR'
+      });
+    });
+
+    it('should handle rate limiting with retry-after header', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        statusText: 'Too Many Requests',
+        headers: new Headers({
+          'retry-after': '60'
+        }),
+      } as Response);
+
+      await expect(downloader['apiRequest']('/test')).rejects.toMatchObject({
+        message: 'Rate limited. Please wait before retrying.',
+        status: 429,
+        errorType: 'RATE_LIMIT',
+        retryAfter: 60
+      });
+    });
+
+    it('should handle server errors', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 500,
+        statusText: 'Internal Server Error',
+        headers: new Headers(),
+      } as Response);
+
+      await expect(downloader['apiRequest']('/test')).rejects.toMatchObject({
+        status: 500,
+        errorType: 'SERVER_ERROR'
+      });
+    });
+
+    it('should validate JSON content type', async () => {
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        headers: new Headers({
+          'content-type': 'text/html'
+        }),
+        json: async () => ({}),
+      } as Response);
+
+      await expect(downloader['apiRequest']('/test')).rejects.toMatchObject({
+        message: 'Invalid response format - expected JSON',
+        errorType: 'INVALID_RESPONSE'
+      });
+    });
+
+    it('should handle timeout errors', async () => {
+      const timeoutError = new Error('Timeout');
+      timeoutError.name = 'AbortError';
+      vi.mocked(fetch).mockRejectedValueOnce(timeoutError);
+
+      await expect(downloader['apiRequest']('/test')).rejects.toMatchObject({
+        message: expect.stringContaining('Request timeout'),
+        errorType: 'TIMEOUT'
+      });
+    });
+
+    it('should handle connection failures', async () => {
+      const networkError = new TypeError('fetch failed');
+      vi.mocked(fetch).mockRejectedValueOnce(networkError);
+
+      await expect(downloader['apiRequest']('/test')).rejects.toMatchObject({
+        message: expect.stringContaining('Network connection failed'),
+        errorType: 'CONNECTION_FAILED'
+      });
     });
 
     it('should handle network errors', async () => {
@@ -427,41 +528,48 @@ describe('VimeoDownloader', () => {
 
   describe('downloadSingleVideo', () => {
     let mockJob: any;
+    let mockFs: any;
 
-    beforeEach(() => {
+    beforeEach(async () => {
       mockJob = {
         video: { uri: '/videos/123', name: 'Test Video' },
         downloadUrl: 'https://example.com/test.mp4',
         filePath: '/test/path/test.mp4',
         size: 1000000
       };
+      
+      mockFs = await import('fs');
     });
 
     it('should return "skipped" when file already exists and not overwriting', async () => {
-      const mockFs = await import('fs');
-      vi.mocked(mockFs.existsSync).mockReturnValue(true);
-      vi.mocked(mockFs.statSync).mockReturnValue({ size: 100 } as any);
+      vi.mocked(mockFs.existsSync)
+        .mockReturnValueOnce(true) // Main file exists
+        .mockReturnValue(false); // No partial file
+      vi.mocked(mockFs.statSync).mockReturnValue({ size: 1000000 } as any); // Complete file
 
       const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
       const result = await downloader['downloadSingleVideo'](mockJob, 1, 1);
 
       expect(result).toBe('skipped');
-      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Skipping Test Video (already exists)'));
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Skipping Test Video (already complete)'));
 
       consoleSpy.mockRestore();
     });
 
-    it('should return "downloaded" when download completes successfully', async () => {
-      const mockFs = await import('fs');
-      vi.mocked(mockFs.existsSync).mockReturnValue(false);
+    it('should resume download from partial file', async () => {
+      const partialSize = 500000;
+      
+      vi.mocked(mockFs.existsSync)
+        .mockReturnValueOnce(false) // Main file doesn't exist
+        .mockReturnValueOnce(true); // Partial file exists
+      vi.mocked(mockFs.statSync).mockReturnValue({ size: partialSize } as any);
       vi.mocked(mockFs.mkdirSync).mockImplementation(() => {});
-      vi.mocked(mockFs.statSync).mockReturnValue({ size: 1000000 } as any);
+      vi.mocked(mockFs.renameSync).mockImplementation(() => {});
 
-      // Mock successful download response
       const mockReader = {
         read: vi.fn()
-          .mockResolvedValueOnce({ done: false, value: new Uint8Array([1, 2, 3]) })
+          .mockResolvedValueOnce({ done: false, value: new Uint8Array(100) })
           .mockResolvedValueOnce({ done: true }),
         releaseLock: vi.fn()
       };
@@ -471,7 +579,89 @@ describe('VimeoDownloader', () => {
         end: vi.fn().mockResolvedValue(undefined)
       };
 
-      // Mock Bun.file
+      global.Bun = {
+        file: vi.fn().mockReturnValue({
+          writer: vi.fn().mockReturnValue(mockWriter),
+          arrayBuffer: vi.fn().mockResolvedValue(new ArrayBuffer(partialSize))
+        })
+      } as any;
+
+      // Mock partial content response (206)
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 206, // Partial content
+        headers: new Headers({
+          'content-length': String(mockJob.size - partialSize)
+        }),
+        body: {
+          getReader: () => mockReader
+        }
+      } as any);
+
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const result = await downloader['downloadSingleVideo'](mockJob, 1, 1);
+
+      expect(result).toBe('downloaded');
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Resuming Test Video'));
+      
+      // Should request with Range header
+      expect(fetch).toHaveBeenCalledWith(
+        mockJob.downloadUrl,
+        expect.objectContaining({
+          headers: expect.objectContaining({
+            'Range': `bytes=${partialSize}-`
+          })
+        })
+      );
+
+      consoleSpy.mockRestore();
+    });
+
+    it('should rename complete partial file', async () => {
+      vi.mocked(mockFs.existsSync)
+        .mockReturnValueOnce(false) // Main file doesn't exist
+        .mockReturnValueOnce(true); // Partial file exists
+      vi.mocked(mockFs.statSync).mockReturnValue({ size: mockJob.size } as any); // Complete partial
+      vi.mocked(mockFs.renameSync).mockImplementation(() => {});
+
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const result = await downloader['downloadSingleVideo'](mockJob, 1, 1);
+
+      expect(result).toBe('downloaded');
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Completed Test Video (was partial)'));
+      expect(mockFs.renameSync).toHaveBeenCalledWith(
+        mockJob.filePath + '.partial',
+        mockJob.filePath
+      );
+
+      consoleSpy.mockRestore();
+    });
+
+    it('should delete corrupted partial file and start over', async () => {
+      vi.mocked(mockFs.existsSync)
+        .mockReturnValueOnce(false) // Main file doesn't exist
+        .mockReturnValueOnce(true); // Corrupted partial file exists
+      vi.mocked(mockFs.statSync)
+        .mockReturnValueOnce({ size: 0 } as any) // Corrupted partial (0 bytes)
+        .mockReturnValue({ size: mockJob.size } as any); // Final verification
+      vi.mocked(mockFs.unlinkSync).mockImplementation(() => {});
+      vi.mocked(mockFs.mkdirSync).mockImplementation(() => {});
+      vi.mocked(mockFs.renameSync).mockImplementation(() => {});
+
+      const mockReader = {
+        read: vi.fn()
+          .mockResolvedValueOnce({ done: false, value: new Uint8Array(100) })
+          .mockResolvedValueOnce({ done: true }),
+        releaseLock: vi.fn()
+      };
+
+      const mockWriter = {
+        write: vi.fn(),
+        end: vi.fn().mockResolvedValue(undefined)
+      };
+
       global.Bun = {
         file: vi.fn().mockReturnValue({
           writer: vi.fn().mockReturnValue(mockWriter)
@@ -480,7 +670,10 @@ describe('VimeoDownloader', () => {
 
       vi.mocked(fetch).mockResolvedValueOnce({
         ok: true,
-        headers: new Map([['content-length', '1000000']]),
+        status: 200,
+        headers: new Headers({
+          'content-length': String(mockJob.size)
+        }),
         body: {
           getReader: () => mockReader
         }
@@ -489,6 +682,197 @@ describe('VimeoDownloader', () => {
       const result = await downloader['downloadSingleVideo'](mockJob, 1, 1);
 
       expect(result).toBe('downloaded');
+      expect(mockFs.unlinkSync).toHaveBeenCalledWith(mockJob.filePath + '.partial');
+      
+      // Should start download from beginning (no Range header)
+      expect(fetch).toHaveBeenCalledWith(
+        mockJob.downloadUrl,
+        expect.not.objectContaining({
+          headers: expect.objectContaining({
+            'Range': expect.any(String)
+          })
+        })
+      );
+    });
+
+    it('should handle range not satisfiable error (416)', async () => {
+      vi.mocked(mockFs.existsSync)
+        .mockReturnValueOnce(false)
+        .mockReturnValueOnce(true);
+      vi.mocked(mockFs.statSync).mockReturnValue({ size: 500000 } as any);
+      vi.mocked(mockFs.mkdirSync).mockImplementation(() => {});
+
+      // Mock 416 Range Not Satisfiable response
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: false,
+        status: 416,
+        statusText: 'Range Not Satisfiable',
+        headers: new Headers()
+      } as any);
+
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      await expect(downloader['downloadSingleVideo'](mockJob, 1, 1)).rejects.toMatchObject({
+        message: 'Range not satisfiable, retrying from beginning',
+        status: 416,
+        errorType: 'SERVER_ERROR'
+      });
+
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Invalid resume range'));
+
+      consoleSpy.mockRestore();
+    });
+
+    it('should handle server that doesn\'t support resume', async () => {
+      vi.mocked(mockFs.existsSync)
+        .mockReturnValueOnce(false)
+        .mockReturnValueOnce(true);
+      vi.mocked(mockFs.statSync).mockReturnValue({ size: 500000 } as any);
+      vi.mocked(mockFs.mkdirSync).mockImplementation(() => {});
+
+      // Mock server response without partial content support
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 200, // Should be 206 for partial content
+        headers: new Headers({
+          'content-length': String(mockJob.size)
+        }),
+        body: {
+          getReader: () => ({
+            read: vi.fn().mockResolvedValue({ done: true }),
+            releaseLock: vi.fn()
+          })
+        }
+      } as any);
+
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      await expect(downloader['downloadSingleVideo'](mockJob, 1, 1)).rejects.toMatchObject({
+        message: 'Resume not supported, retrying from beginning',
+        errorType: 'SERVER_ERROR'
+      });
+
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('Server doesn\'t support resume'));
+
+      consoleSpy.mockRestore();
+    });
+
+    it('should verify file size after download', async () => {
+      vi.mocked(mockFs.existsSync).mockReturnValue(false);
+      vi.mocked(mockFs.mkdirSync).mockImplementation(() => {});
+      vi.mocked(mockFs.statSync).mockReturnValue({ size: 999999 } as any); // Wrong size
+      vi.mocked(mockFs.renameSync).mockImplementation(() => {});
+
+      const mockReader = {
+        read: vi.fn().mockResolvedValueOnce({ done: true }),
+        releaseLock: vi.fn()
+      };
+
+      const mockWriter = {
+        write: vi.fn(),
+        end: vi.fn().mockResolvedValue(undefined)
+      };
+
+      global.Bun = {
+        file: vi.fn().mockReturnValue({
+          writer: vi.fn().mockReturnValue(mockWriter)
+        })
+      } as any;
+
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: new Headers({
+          'content-length': String(mockJob.size)
+        }),
+        body: {
+          getReader: () => mockReader
+        }
+      } as any);
+
+      await expect(downloader['downloadSingleVideo'](mockJob, 1, 1)).rejects.toThrow(
+        'File size mismatch: expected 1000000, got 999999'
+      );
+    });
+
+    it('should preserve partial file on download failure', async () => {
+      vi.mocked(mockFs.existsSync).mockReturnValue(false);
+      vi.mocked(mockFs.mkdirSync).mockImplementation(() => {});
+      vi.mocked(mockFs.statSync).mockReturnValue({ size: 500000 } as any);
+
+      const networkError = new Error('Network failed');
+      const mockReader = {
+        read: vi.fn().mockRejectedValue(networkError),
+        releaseLock: vi.fn()
+      };
+
+      const mockWriter = {
+        write: vi.fn(),
+        end: vi.fn().mockRejectedValue(new Error('Writer error'))
+      };
+
+      global.Bun = {
+        file: vi.fn().mockReturnValue({
+          writer: vi.fn().mockReturnValue(mockWriter)
+        })
+      } as any;
+
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: new Headers({
+          'content-length': String(mockJob.size)
+        }),
+        body: {
+          getReader: () => mockReader
+        }
+      } as any);
+
+      await expect(downloader['downloadSingleVideo'](mockJob, 1, 1)).rejects.toThrow();
+
+      // Should not delete partial file (only small corrupted ones)
+      expect(mockFs.unlinkSync).not.toHaveBeenCalledWith(mockJob.filePath + '.partial');
+    });
+
+    it('should delete very small corrupted partial files on error', async () => {
+      vi.mocked(mockFs.existsSync).mockReturnValue(false);
+      vi.mocked(mockFs.mkdirSync).mockImplementation(() => {});
+      vi.mocked(mockFs.statSync)
+        .mockReturnValueOnce({ size: 500 } as any); // Small corrupted file
+      vi.mocked(mockFs.unlinkSync).mockImplementation(() => {});
+
+      const networkError = new Error('Network failed');
+      const mockReader = {
+        read: vi.fn().mockRejectedValue(networkError),
+        releaseLock: vi.fn()
+      };
+
+      const mockWriter = {
+        write: vi.fn(),
+        end: vi.fn().mockRejectedValue(new Error('Writer error'))
+      };
+
+      global.Bun = {
+        file: vi.fn().mockReturnValue({
+          writer: vi.fn().mockReturnValue(mockWriter)
+        })
+      } as any;
+
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: new Headers({
+          'content-length': String(mockJob.size)
+        }),
+        body: {
+          getReader: () => mockReader
+        }
+      } as any);
+
+      await expect(downloader['downloadSingleVideo'](mockJob, 1, 1)).rejects.toThrow();
+
+      // Should delete small corrupted files
+      expect(mockFs.unlinkSync).toHaveBeenCalledWith(mockJob.filePath + '.partial');
     });
   });
 

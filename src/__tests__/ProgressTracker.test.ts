@@ -1,16 +1,44 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { ProgressTracker } from '../ProgressTracker';
 import type { DownloadProgress } from '../ProgressTracker';
+import { existsSync, unlinkSync } from 'fs';
+import path from 'path';
 
 // Mock Date for consistent testing
 const mockNow = new Date('2023-01-01T12:00:00Z').getTime();
 vi.setSystemTime(mockNow);
 
+// Mock file system operations
+vi.mock('fs', () => ({
+  existsSync: vi.fn(),
+  unlinkSync: vi.fn(),
+}));
+
+// Mock Bun.file and Bun.write
+global.Bun = {
+  file: vi.fn(),
+  write: vi.fn(),
+} as any;
+
 describe('ProgressTracker', () => {
   let tracker: ProgressTracker;
+  const testDownloadPath = '/test/downloads';
 
   beforeEach(() => {
-    tracker = new ProgressTracker();
+    vi.clearAllMocks();
+    vi.mocked(existsSync).mockReturnValue(false);
+    vi.mocked(Bun.file).mockReturnValue({
+      text: vi.fn().mockResolvedValue('{}'),
+    });
+    vi.mocked(Bun.write).mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    // Clean up any timers
+    if (tracker && (tracker as any).saveInterval) {
+      clearInterval((tracker as any).saveInterval);
+    }
+    vi.useRealTimers();
   });
 
   describe('startDownload', () => {
@@ -226,7 +254,296 @@ describe('ProgressTracker', () => {
     });
   });
 
+  describe('Persistence Features', () => {
+    beforeEach(() => {
+      tracker = new ProgressTracker(testDownloadPath);
+    });
+
+    it('should create progress file in correct location', () => {
+      const expectedPath = path.join(testDownloadPath, '.vimeo-download-progress.json');
+      expect((tracker as any).persistenceFile).toBe(expectedPath);
+    });
+
+    it('should use current working directory when no path provided', () => {
+      const tracker2 = new ProgressTracker();
+      const expectedPath = path.join(process.cwd(), '.vimeo-download-progress.json');
+      expect((tracker2 as any).persistenceFile).toBe(expectedPath);
+    });
+
+    it('should save progress automatically every 5 seconds', async () => {
+      vi.useFakeTimers();
+      
+      tracker.startDownload('test-id', 1000000, 'test.mp4');
+      tracker.updateProgress('test-id', 500000);
+      
+      // Fast-forward 5 seconds
+      vi.advanceTimersByTime(5000);
+      
+      expect(Bun.write).toHaveBeenCalledWith(
+        expect.stringContaining('.vimeo-download-progress.json'),
+        expect.stringContaining('test-id')
+      );
+    });
+
+    it('should save progress immediately on completion', () => {
+      tracker.startDownload('test-id', 1000000, 'test.mp4');
+      tracker.completeDownload('test-id');
+      
+      expect(Bun.write).toHaveBeenCalledWith(
+        expect.stringContaining('.vimeo-download-progress.json'),
+        expect.any(String)
+      );
+    });
+
+    it('should save progress immediately on failure', () => {
+      tracker.startDownload('test-id', 1000000, 'test.mp4');
+      tracker.failDownload('test-id', 'Network error');
+      
+      expect(Bun.write).toHaveBeenCalledWith(
+        expect.stringContaining('.vimeo-download-progress.json'),
+        expect.any(String)
+      );
+    });
+
+    it('should load existing progress on startup', async () => {
+      const existingProgress = {
+        timestamp: Date.now(),
+        downloads: [
+          {
+            id: 'existing-id',
+            filename: 'existing.mp4',
+            totalSize: 2000000,
+            downloadedSize: 1000000,
+            startTime: mockNow - 10000,
+            completed: false,
+            failed: false
+          }
+        ]
+      };
+
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(Bun.file).mockReturnValue({
+        text: vi.fn().mockResolvedValue(JSON.stringify(existingProgress)),
+      });
+
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      // Create new tracker that should load existing progress
+      const newTracker = new ProgressTracker(testDownloadPath);
+      
+      // Wait for async loading to complete
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(consoleSpy).toHaveBeenCalledWith('📄 Restored 1 incomplete download(s) from previous session');
+      
+      // Should not load completed or failed downloads
+      expect(newTracker.getAllProgress()).toHaveLength(0); // Initially empty until loaded
+      
+      consoleSpy.mockRestore();
+    });
+
+    it('should only load incomplete downloads', async () => {
+      const existingProgress = {
+        downloads: [
+          {
+            id: 'incomplete-id',
+            filename: 'incomplete.mp4',
+            totalSize: 1000000,
+            downloadedSize: 500000,
+            startTime: mockNow,
+            completed: false,
+            failed: false
+          },
+          {
+            id: 'completed-id',
+            filename: 'completed.mp4',
+            totalSize: 1000000,
+            downloadedSize: 1000000,
+            startTime: mockNow,
+            completed: true,
+            failed: false
+          },
+          {
+            id: 'failed-id',
+            filename: 'failed.mp4',
+            totalSize: 1000000,
+            downloadedSize: 100000,
+            startTime: mockNow,
+            completed: false,
+            failed: true
+          }
+        ]
+      };
+
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(Bun.file).mockReturnValue({
+        text: vi.fn().mockResolvedValue(JSON.stringify(existingProgress)),
+      });
+
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      new ProgressTracker(testDownloadPath);
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      // Should only mention 1 incomplete download
+      expect(consoleSpy).toHaveBeenCalledWith('📄 Restored 1 incomplete download(s) from previous session');
+      
+      consoleSpy.mockRestore();
+    });
+
+    it('should handle corrupted progress file gracefully', async () => {
+      vi.mocked(existsSync).mockReturnValue(true);
+      vi.mocked(Bun.file).mockReturnValue({
+        text: vi.fn().mockResolvedValue('invalid json'),
+      });
+
+      const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+      new ProgressTracker(testDownloadPath);
+      await new Promise(resolve => setTimeout(resolve, 0));
+
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Could not load previous download progress'),
+        expect.any(String)
+      );
+      
+      consoleSpy.mockRestore();
+    });
+
+    it('should clean up progress file when all downloads complete', async () => {
+      tracker.startDownload('test-id', 1000000, 'test.mp4');
+      tracker.completeDownload('test-id');
+      
+      // Simulate cleanup on exit
+      (tracker as any).cleanup();
+      
+      expect(unlinkSync).toHaveBeenCalledWith(
+        expect.stringContaining('.vimeo-download-progress.json')
+      );
+    });
+
+    it('should not clean up progress file when incomplete downloads exist', () => {
+      tracker.startDownload('incomplete-id', 1000000, 'incomplete.mp4');
+      tracker.updateProgress('incomplete-id', 500000);
+      
+      // Simulate cleanup on exit
+      (tracker as any).cleanup();
+      
+      expect(unlinkSync).not.toHaveBeenCalled();
+    });
+
+    it('should update existing download from previous session', () => {
+      // Simulate existing download
+      const existingDownload: DownloadProgress = {
+        id: 'existing-id',
+        filename: 'old-name.mp4',
+        totalSize: 1000000,
+        downloadedSize: 500000,
+        startTime: mockNow - 10000,
+        completed: false,
+        failed: false
+      };
+      
+      (tracker as any).downloads.set('existing-id', existingDownload);
+      
+      // Start "new" download with same ID
+      tracker.startDownload('existing-id', 2000000, 'new-name.mp4');
+      
+      const progress = tracker.getProgress('existing-id');
+      expect(progress?.filename).toBe('new-name.mp4');
+      expect(progress?.totalSize).toBe(2000000);
+      expect(progress?.downloadedSize).toBe(500000); // Preserved
+    });
+  });
+
+  describe('New utility methods', () => {
+    beforeEach(() => {
+      tracker = new ProgressTracker();
+    });
+
+    it('should return incomplete downloads', () => {
+      tracker.startDownload('incomplete1', 1000000, 'incomplete1.mp4');
+      tracker.startDownload('incomplete2', 2000000, 'incomplete2.mp4');
+      tracker.startDownload('completed', 1000000, 'completed.mp4');
+      tracker.startDownload('failed', 1000000, 'failed.mp4');
+      
+      tracker.updateProgress('incomplete1', 500000);
+      tracker.updateProgress('incomplete2', 750000);
+      tracker.completeDownload('completed');
+      tracker.failDownload('failed', 'Error');
+      
+      const incompleteDownloads = tracker.getIncompleteDownloads();
+      
+      expect(incompleteDownloads).toHaveLength(2);
+      expect(incompleteDownloads.map(d => d.id)).toEqual(['incomplete1', 'incomplete2']);
+    });
+
+    it('should check if there are incomplete downloads', () => {
+      expect(tracker.hasIncompleteDownloads()).toBe(false);
+      
+      tracker.startDownload('test-id', 1000000, 'test.mp4');
+      expect(tracker.hasIncompleteDownloads()).toBe(true);
+      
+      tracker.completeDownload('test-id');
+      expect(tracker.hasIncompleteDownloads()).toBe(false);
+    });
+  });
+
+  describe('failDownload functionality', () => {
+    beforeEach(() => {
+      tracker = new ProgressTracker();
+      tracker.startDownload('test-id', 1000000, 'test.mp4');
+    });
+
+    it('should mark download as failed with error message', () => {
+      const errorMessage = 'Network connection failed';
+      
+      tracker.failDownload('test-id', errorMessage);
+      
+      const progress = tracker.getProgress('test-id');
+      expect(progress?.failed).toBe(true);
+      expect(progress?.errorMessage).toBe(errorMessage);
+      expect(progress?.endTime).toBeDefined();
+    });
+
+    it('should check if download is failed', () => {
+      expect(tracker.isDownloadFailed('test-id')).toBe(false);
+      
+      tracker.failDownload('test-id', 'Error occurred');
+      
+      expect(tracker.isDownloadFailed('test-id')).toBe(true);
+    });
+
+    it('should return failed downloads', () => {
+      tracker.startDownload('failed1', 1000000, 'failed1.mp4');
+      tracker.startDownload('failed2', 2000000, 'failed2.mp4');
+      tracker.startDownload('success', 1000000, 'success.mp4');
+      
+      tracker.failDownload('failed1', 'Error 1');
+      tracker.failDownload('failed2', 'Error 2');
+      tracker.completeDownload('success');
+      
+      const failedDownloads = tracker.getFailedDownloads();
+      
+      expect(failedDownloads).toHaveLength(2);
+      expect(failedDownloads.map(d => d.id)).toEqual(['failed1', 'failed2']);
+      expect(failedDownloads[0].errorMessage).toBe('Error 1');
+      expect(failedDownloads[1].errorMessage).toBe('Error 2');
+    });
+
+    it('should handle failing non-existent download', () => {
+      expect(() => {
+        tracker.failDownload('non-existent', 'Some error');
+      }).not.toThrow();
+      
+      expect(tracker.isDownloadFailed('non-existent')).toBe(false);
+    });
+  });
+
   describe('Edge Cases and Error Handling', () => {
+    beforeEach(() => {
+      tracker = new ProgressTracker();
+    });
     it('should handle concurrent updates to same download', () => {
       tracker.startDownload('concurrent-id', 1000000, 'test.mp4');
       
